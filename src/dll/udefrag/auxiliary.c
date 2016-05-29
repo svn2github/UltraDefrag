@@ -150,7 +150,6 @@ void dbg_print_performance_counters(udefrag_job_parameters *jp)
     dbg_print_single_counter(jp,jp->p_counters.analysis_time,             "analysis ...............");
     dbg_print_single_counter(jp,jp->p_counters.searching_time,            "searching ..............");
     dbg_print_single_counter(jp,jp->p_counters.moving_time,               "moving .................");
-    dbg_print_single_counter(jp,jp->p_counters.temp_space_releasing_time, "releasing temp space ...");
 }
 
 /**

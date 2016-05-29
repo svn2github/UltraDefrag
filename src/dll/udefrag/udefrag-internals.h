@@ -187,7 +187,6 @@ struct performance_counters {
     ULONGLONG analysis_time;              /* time spent for volume analysis */
     ULONGLONG searching_time;             /* time spent for searching */
     ULONGLONG moving_time;                /* time spent for file moves */
-    ULONGLONG temp_space_releasing_time;  /* time spent to release space temporarily allocated by system */
 };
 
 #define TINY_FILE_SIZE            0 * 1024  /* < 10 KB */
@@ -223,14 +222,14 @@ typedef struct _udefrag_job_parameters {
     file_system_type fs_type;                   /* type of the file system */
     int is_fat;                                 /* nonzero value indicates that the file system is a kind of FAT */
     winx_file_info *filelist;                   /* list of files */
-    struct prb_table *fragmented_files;         /* list of fragmented files; does not contain filtered out files */
-    winx_volume_region *free_regions;           /* list of free space regions */
+    struct prb_table *fragmented_files;         /* binary tree of fragmented files; does not contain filtered out files */
+    struct prb_table *free_regions;             /* binary tree of free space regions */
     unsigned long free_regions_count;           /* number of free space regions */
     ULONGLONG clusters_at_once;                 /* number of clusters to be moved at once */
     cmap cluster_map;                           /* cluster map's internal data */
     WINX_FILE *fVolume;                         /* handle of the volume, intended for use by file moving routines */
     struct performance_counters p_counters;     /* performance counters */
-    struct prb_table *file_blocks;              /* pointer to the binary tree of all file blocks found on the volume */
+    struct prb_table *file_blocks;              /* binary tree of all file blocks found on the volume */
     struct file_counters f_counters;            /* file counters */
     NTSTATUS last_move_status;                  /* status of the last move file operation; zero by default */
     ULONGLONG already_optimized_clusters;       /* number of clusters needing no sorting in optimization */
@@ -254,8 +253,6 @@ void colorize_map_region(udefrag_job_parameters *jp,
         ULONGLONG lcn, ULONGLONG length, int new_color, int old_color);
 void colorize_file(udefrag_job_parameters *jp, winx_file_info *f, int old_color);
 int get_file_color(udefrag_job_parameters *jp, winx_file_info *f);
-void release_temp_space_regions(udefrag_job_parameters *jp);
-void redraw_all_temporary_system_space_as_free(udefrag_job_parameters *jp);
 
 int analyze(udefrag_job_parameters *jp);
 int defragment(udefrag_job_parameters *jp);
@@ -294,11 +291,10 @@ int move_file(winx_file_info *f,
 int can_move(winx_file_info *f,udefrag_job_parameters *jp);
 int can_move_entirely(winx_file_info *f,udefrag_job_parameters *jp);
 
-winx_volume_region *find_first_free_region(udefrag_job_parameters *jp,
-    ULONGLONG min_lcn,ULONGLONG min_length,ULONGLONG *max_length);
-winx_volume_region *find_last_free_region(udefrag_job_parameters *jp,
-    ULONGLONG min_lcn,ULONGLONG min_length,ULONGLONG *max_length);
+winx_volume_region *find_first_free_region(udefrag_job_parameters *jp,ULONGLONG min_lcn,ULONGLONG min_length);
+winx_volume_region *find_last_free_region(udefrag_job_parameters *jp,ULONGLONG min_lcn,ULONGLONG min_length);
 winx_volume_region *find_largest_free_region(udefrag_job_parameters *jp);
+void update_free_space_layout(udefrag_job_parameters *jp,ULONGLONG lcn,ULONGLONG length);
 
 int create_file_blocks_tree(udefrag_job_parameters *jp);
 int add_block_to_file_blocks_tree(udefrag_job_parameters *jp, winx_file_info *file, winx_blockmap *block);

@@ -26,28 +26,6 @@
 
 #include "udefrag-internals.h"
 
-/**
- * @internal
- * @brief Actualizes the list of free space regions.
- * @details All NTFS regions temporarily allocated
- * by system become released after this call.
- */
-void release_temp_space_regions(udefrag_job_parameters *jp)
-{
-    ULONGLONG time = winx_xtime();
-    
-    if(!jp->udo.dry_run){
-        winx_release_free_volume_regions(jp->free_regions);
-        jp->free_regions = winx_get_free_volume_regions(jp->volume_letter,
-            WINX_GVR_ALLOW_PARTIAL_SCAN,NULL,(void *)jp);
-        if(jp->win_version < WINDOWS_XP){
-            jp->free_regions = winx_sub_volume_region(jp->free_regions,
-                jp->mft_zone.start,jp->mft_zone.length);
-        }
-        jp->p_counters.temp_space_releasing_time += winx_xtime() - time;
-    }
-}
-
 /************************************************************/
 /*                    can_move routine                      */
 /************************************************************/
@@ -660,8 +638,8 @@ int move_file(winx_file_info *f,
     if(moving_result == DETERMINED_MOVING_FAILURE){
         winx_list_destroy((list_entry **)(void *)&new_file_info.disp.blockmap);
         f->user_defined_flags |= UD_FILE_MOVING_FAILED;
-        /* remove target space from the free space pool */
-        jp->free_regions = winx_sub_volume_region(jp->free_regions,target,length);
+        /* rescan target space */
+        update_free_space_layout(jp,target,length);
         jp->p_counters.moving_time += winx_xtime() - time;
         return (-1);
     }
@@ -697,7 +675,11 @@ int move_file(winx_file_info *f,
     colorize_map_region(jp,target,length,new_color,FREE_SPACE);
             
     /* remove target space from the free space pool - before the following map redraw */
-    jp->free_regions = winx_sub_volume_region(jp->free_regions,target,length);
+    if(moving_result == DETERMINED_MOVING_PARTIAL_SUCCESS){
+        update_free_space_layout(jp,target,length);
+    } else {
+        winx_sub_volume_region(jp->free_regions,target,length);
+    }
     
     /* redraw file clusters in the new color */
     if(new_color != old_color){
@@ -707,28 +689,38 @@ int move_file(winx_file_info *f,
         }
     }
     
-    /* redraw the released range of clusters */
-    if(moving_result != DETERMINED_MOVING_PARTIAL_SUCCESS){
-        clusters_to_redraw = length;
-        curr_vcn = vcn;
-        first_block = get_first_block_of_cluster_chain(f,vcn);
-        for(block = first_block; block; block = block->next){
-            /* redraw the current block or its part */
-            lcn = block->lcn + (curr_vcn - block->vcn);
-            n = min(block->length - (curr_vcn - block->vcn),clusters_to_redraw);
+    /* redraw released clusters and add them to the free space pool */
+    clusters_to_redraw = length; curr_vcn = vcn;
+    first_block = get_first_block_of_cluster_chain(f,vcn);
+    for(block = first_block; block; block = block->next){
+        /* redraw the current block or its part */
+        lcn = block->lcn + (curr_vcn - block->vcn);
+        n = min(block->length - (curr_vcn - block->vcn),clusters_to_redraw);
+
+        /* redraw clusters in white only if all of them have been released */
+        if(moving_result != DETERMINED_MOVING_PARTIAL_SUCCESS)
             colorize_map_region(jp,lcn,n,FREE_SPACE,new_color);
-            clusters_to_redraw -= n;
+
+        /* add clusters to the free space pool */
+        if(moving_result == DETERMINED_MOVING_PARTIAL_SUCCESS){
+            update_free_space_layout(jp,lcn,n);
+        } else {
             if(jp->fs_type != FS_NTFS || jp->udo.dry_run){
-                /* on NTFS we cannot use the released space until
-                   release_temp_space_regions call because Windows
-                   marks clusters as temporarily allocated
-                   immediately after the move
+                winx_add_volume_region(jp->free_regions,lcn,n);
+            } else {
+                /* on NTFS we'd have to rescan clusters
+                   to release space which belonged to the
+                   file, but we ain't doing this here, for
+                   performance reasons; instead, we rescan
+                   them all later, between transfers of
+                   large portions of data
                 */
-                jp->free_regions = winx_add_volume_region(jp->free_regions,lcn,n);
             }
-            if(!clusters_to_redraw || block->next == f->disp.blockmap) break;
-            curr_vcn = block->next->vcn;
         }
+
+        clusters_to_redraw -= n;
+        if(!clusters_to_redraw || block->next == f->disp.blockmap) break;
+        curr_vcn = block->next->vcn;
     }
 
     /* adjust statistics */

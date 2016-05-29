@@ -50,19 +50,25 @@ void test_move(winx_file_info *f,udefrag_job_parameters *jp)
 {
     winx_volume_region *target_rgn;
     ULONGLONG source_lcn = f->disp.blockmap->lcn;
+    ULONGLONG target_lcn;
     
     /* try to move the first cluster to the last free region */
-    target_rgn = find_last_free_region(jp,1);
+    target_rgn = find_last_free_region(jp,0,1);
     if(target_rgn == NULL){
         etrace("no free region found on disk");
         return;
     }
-    if(move_file(f,f->disp.blockmap->vcn,1,target_rgn->lcn,jp) < 0){
+    target_lcn = target_rgn->lcn;
+    if(move_file(f,f->disp.blockmap->vcn,1,target_lcn,jp) < 0){
         etrace("move failed for %ws",f->path);
         return;
     } else {
         dtrace("move succeeded for %ws",f->path);
     }
+
+    /* force Windows to release space */
+    update_free_space_layout(jp,source_lcn,1);
+
     /* try to move the first cluster back */
     if(can_move(f,jp)){
         if(move_file(f,f->disp.blockmap->vcn,1,source_lcn,jp) < 0){
@@ -74,8 +80,9 @@ void test_move(winx_file_info *f,udefrag_job_parameters *jp)
     } else {
         etrace("file became unmovable %ws",f->path);
     }
-    /* release temporarily allocated space */
-    release_temp_space_regions(jp);
+    
+    /* release target space as well */
+    update_free_space_layout(jp,target_lcn,1);
 }
 
 /*
@@ -287,8 +294,9 @@ static int defrag_routine(udefrag_job_parameters *jp)
     jp->pi.current_operation = VOLUME_DEFRAGMENTATION;
     jp->pi.moved_clusters = 0;
 
-    /* release temporarily allocated space */
-    release_temp_space_regions(jp);
+    /* force Windows to release space which belonged to files moved before */
+    if(jp->fs_type == FS_NTFS && !jp->udo.dry_run && jp->pi.pass_number > 0)
+        update_free_space_layout(jp,0,jp->v_info.total_clusters);
 
     /* no files are excluded by this task currently */
     clear_currently_excluded_flag(jp);
@@ -322,11 +330,9 @@ static int defrag_routine(udefrag_job_parameters *jp)
             move_entirely = 0;
             if(file->disp.clusters * jp->v_info.bytes_per_cluster \
               < 2 * jp->udo.fragment_size_threshold) move_entirely = 1;
-            else if(jp->win_version < WINDOWS_XP && jp->fs_type == FS_NTFS)
-                move_entirely = 1; /* keep algorithm simple */
             if(move_entirely){
                 /* move the entire file */
-                rgn = find_first_free_region(jp,0,file->disp.clusters,NULL);
+                rgn = find_first_free_region(jp,0,file->disp.clusters);
                 if(rgn){
                     x = jp->pi.moved_clusters;
                     if(move_file(file,file->disp.blockmap->vcn,
@@ -421,7 +427,7 @@ move_clusters:
                     if(length == 0 || n < 2){
                         min_vcn = max_vcn;
                     } else {
-                        rgn = find_first_free_region(jp,0,length,NULL);
+                        rgn = find_first_free_region(jp,0,length);
                         if(rgn){
                             if(move_file(file,vcn,length,rgn->lcn,jp) >= 0){
                                 if(jp->udo.dbgprint_level >= DBG_DETAILED)

@@ -211,7 +211,7 @@ static int process_free_region(winx_volume_region *rgn,void *user_defined_data)
     colorize_map_region(jp,rgn->lcn,rgn->length,FREE_SPACE,SYSTEM_SPACE);
     jp->pi.processed_clusters += rgn->length;
     jp->free_regions_count ++;
-    return 0; /* continue scan */
+    return jp->termination_router((void *)jp);
 }
 
 /**
@@ -224,15 +224,16 @@ static int get_free_space_layout(udefrag_job_parameters *jp)
     char buffer[32];
 
     jp->free_regions = winx_get_free_volume_regions(jp->volume_letter,
-        WINX_GVR_ALLOW_PARTIAL_SCAN,process_free_region,(void *)jp);
+        0,jp->v_info.total_clusters,WINX_GVR_ALLOW_PARTIAL_SCAN,
+        process_free_region,(void *)jp);
+    if(jp->free_regions == NULL) return (-1);
     
     winx_bytes_to_hr(jp->v_info.free_bytes,1,buffer,sizeof(buffer));
     itrace("free space amount : %s",buffer);
     itrace("free regions count: %u",jp->free_regions_count);
     
     /* let full disks to pass the analysis successfully */
-    if(jp->free_regions == NULL || jp->free_regions_count == 0)
-        etrace("disk is full or some error has been encountered");
+    if(jp->free_regions_count == 0) itrace("the disk is full");
     return 0;
 }
 
@@ -287,8 +288,6 @@ static void get_mft_zones_layout(udefrag_job_parameters *jp)
     if(check_region(jp,start,length)){
         /* remark space as MFT Zone */
         colorize_map_region(jp,start,length,MFT_ZONE_SPACE,0);
-        if(jp->win_version < WINDOWS_XP)
-            jp->free_regions = winx_sub_volume_region(jp->free_regions,start,length);
         jp->mft_zone.start = start; jp->mft_zone.length = length;
     }
 
@@ -908,6 +907,67 @@ int analyze(udefrag_job_parameters *jp)
     jp->p_counters.analysis_time = winx_xtime() - time;
     stop_timing("analysis",time,jp);
     return 0;
+}
+
+/**
+ * @internal
+ * @brief A callback procedure for update_free_space_layout.
+ */
+static int cb(winx_volume_region *rgn,void *user_defined_data)
+{
+    udefrag_job_parameters *jp = \
+        (udefrag_job_parameters *)user_defined_data;
+    
+    if(jp->udo.dbgprint_level >= DBG_PARANOID){
+        itrace("Free block start: %I64u "
+            "len: %I64u",rgn->lcn,rgn->length);
+    }
+
+    return jp->termination_router((void *)jp);
+}
+
+/**
+ * @internal
+ * @brief Updates free space layout.
+ * @details Whenever a file gets moved by the FSCTL_MOVE_FILE request
+ * on a volume formatted in NTFS Windows refuses to release clusters
+ * which belonged to the file immediately. This routine is intended
+ * to release those clusters within the specified range. Of course,
+ * it actualizes free space layout as well.
+ * @param[in] jp the job parameters.
+ * @param[in] lcn the logical cluster number of the region to be rescanned.
+ * @param[in] length size of the region to be rescanned, in clusters.
+ */
+void update_free_space_layout(udefrag_job_parameters *jp,
+        ULONGLONG lcn,ULONGLONG length)
+{
+    struct prb_table *regions;
+    winx_volume_region *rgn;
+    struct prb_traverser t;
+    
+    /* handle special case when the entire disk has to be rescanned */
+    if(lcn == 0 && length == jp->v_info.total_clusters){
+        itrace("free space layout has to be updated...");
+        winx_release_free_volume_regions(jp->free_regions);
+        jp->free_regions = winx_get_free_volume_regions(jp->volume_letter,0,
+            jp->v_info.total_clusters,WINX_GVR_ALLOW_PARTIAL_SCAN,cb,(void *)jp);
+        itrace("free space layout updated");
+        return;
+    }
+
+    winx_sub_volume_region(jp->free_regions,lcn,length);
+    
+    regions = winx_get_free_volume_regions(jp->volume_letter,
+        lcn,length,WINX_GVR_ALLOW_PARTIAL_SCAN,cb,(void *)jp);
+    if(regions == NULL) return;
+    
+    rgn = prb_t_first(&t,regions);
+    while(rgn){
+        winx_add_volume_region(jp->free_regions,rgn->lcn,rgn->length);
+        rgn = prb_t_next(&t);
+    }
+    
+    winx_release_free_volume_regions(regions);
 }
 
 /** @} */

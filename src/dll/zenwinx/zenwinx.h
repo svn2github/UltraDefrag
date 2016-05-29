@@ -516,21 +516,17 @@ int winx_vflush(char volume_letter);
 #define WINX_GVR_ALLOW_PARTIAL_SCAN  0x1
 
 typedef struct _winx_volume_region {
-    struct _winx_volume_region *next;  /* pointer to the next region */
-    struct _winx_volume_region *prev;  /* pointer to the previous region */
-    ULONGLONG lcn;                     /* the logical cluster number */
-    ULONGLONG length;                  /* size of the region, in clusters */
+    ULONGLONG lcn;    /* the logical cluster number */
+    ULONGLONG length; /* size of the region, in clusters */
 } winx_volume_region;
 
-typedef int (*volume_region_callback)(winx_volume_region *reg,void *user_defined_data);
+typedef int (*volume_region_callback)(winx_volume_region *rgn,void *user_defined_data);
 
-winx_volume_region *winx_get_free_volume_regions(char volume_letter,
-        int flags,volume_region_callback cb,void *user_defined_data);
-winx_volume_region *winx_add_volume_region(winx_volume_region *rlist,
-        ULONGLONG lcn,ULONGLONG length);
-winx_volume_region *winx_sub_volume_region(winx_volume_region *rlist,
-        ULONGLONG lcn,ULONGLONG length);
-void winx_release_free_volume_regions(winx_volume_region *rlist);
+struct prb_table *winx_get_free_volume_regions(char volume_letter,
+        ULONGLONG start_lcn,ULONGLONG length,int flags,volume_region_callback cb,void *user_defined_data);
+winx_volume_region *winx_add_volume_region(struct prb_table *regions,ULONGLONG lcn,ULONGLONG length);
+void winx_sub_volume_region(struct prb_table *regions,ULONGLONG lcn,ULONGLONG length);
+void winx_release_free_volume_regions(struct prb_table *regions);
 
 /* zenwinx.c */
 int winx_init_library(void);

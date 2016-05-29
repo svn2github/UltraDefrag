@@ -450,8 +450,37 @@ int winx_vflush(char volume_letter)
 }
 
 /**
+ * @internal
+ * @brief Defines sorting rules for trees of free space regions.
+ */
+static int compare_regions(const void *prb_a, const void *prb_b, void *prb_param)
+{
+    winx_volume_region *a, *b;
+    
+    a = (winx_volume_region *)prb_a;
+    b = (winx_volume_region *)prb_b;
+    
+    /* sort regions by LCN in ascending order */
+    if(a->lcn < b->lcn) return (-1);
+    if(a->lcn == b->lcn) return 0;
+    return 1;
+}
+
+/**
+ * @internal
+ * @brief Releases memory allocated for a single tree item.
+ */
+static void free_item(void *prb_item, void *prb_param)
+{
+    winx_volume_region *rgn = (winx_volume_region *)prb_item;
+    winx_free(rgn);
+}
+
+/**
  * @brief Enumerates free regions on the specified volume.
  * @param[in] volume_letter the volume letter.
+ * @param[in] start_lcn the logical cluster number to start with.
+ * @param[in] length number of clusters to scan.
  * @param[in] flags a combination of WINX_GVR_xxx flags.
  * @param[in] cb the address of the procedure to be called
  * each time when a free region is found on the volume.
@@ -459,18 +488,48 @@ int winx_vflush(char volume_letter)
  * the scan terminates immediately.
  * @param[in] user_defined_data pointer to data
  * to be passed to the registered callback.
- * @return The list of free regions, NULL indicates that
- * either the disk is full (unlikely) or some error occured.
+ * @return Binary tree of the free space
+ * regions, NULL indicates failure.
  * @note
- * - It is possible to scan the disk partially by requesting
- * the scan termination through the callback procedure.
- * - The callback procedure should complete as quickly
- * as possible to avoid slowdown of the scan.
+ * - Whenever a file gets moved by the FSCTL_MOVE_FILE request on a volume
+ * formatted in NTFS Windows refuses to release clusters which belonged to
+ * the file immediately. However, a call to winx_get_free_volume_regions
+ * forces Windows to release all those clusters within the scanned region.
+ * - This function as well as others guarantee that all the
+ * regions follow each other and none of them has zero length.
+ * @par Example:
+ * @code
+ * char volume_letter = 'c';
+ * winx_volume_information v;
+ * struct prb_table *free_regions;
+ * struct prb_traverser t;
+ * winx_volume_region *rgn;
+ *
+ * // get total number of clusters to scan
+ * if(winx_get_volume_information(volume_letter,&v) == 0){
+ *     // enumerate all free regions on the volume
+ *     free_regions = winx_get_free_volume_regions(
+ *         volume_letter,0,v.total_clusters,0,NULL,NULL);
+ *     if(free_regions){
+ *         // loop through the list of regions
+ *         prb_t_init(&t,free_regions);
+ *         while(1){
+ *             rgn = prb_t_next(&t);
+ *             if(rgn == NULL) break;
+ *
+ *             dtrace("LCN: %I64u, LENGTH: %I64u",
+ *                 rgn->lcn,rgn->length);
+ *         }
+ *     }
+ * }
+ * @endcode
  */
-winx_volume_region *winx_get_free_volume_regions(char volume_letter,
-        int flags, volume_region_callback cb, void *user_defined_data)
+struct prb_table *winx_get_free_volume_regions(char volume_letter,
+        ULONGLONG start_lcn, ULONGLONG length, int flags,
+        volume_region_callback cb, void *user_defined_data)
 {
-    winx_volume_region *rlist = NULL, *rgn = NULL;
+    struct prb_table *regions = NULL;
+    winx_volume_region *rgn = NULL;
     BITMAP_DESCRIPTOR *bitmap;
     #define LLINVALID   ((ULONGLONG) -1)
     #define BITMAPBYTES 4096
@@ -478,31 +537,33 @@ winx_volume_region *winx_get_free_volume_regions(char volume_letter,
     /* bit shifting array for efficient processing of the bitmap */
     unsigned char bitshift[] = { 1, 2, 4, 8, 16, 32, 64, 128 };
     WINX_FILE *f;
-    ULONGLONG i, start, next, free_rgn_start;
+    ULONGLONG i, n, start, next, free_rgn_start;
     IO_STATUS_BLOCK iosb;
     NTSTATUS status;
-    
+
     /* ensure that it will work on w2k */
     volume_letter = winx_toupper(volume_letter);
     
     /* allocate memory */
     bitmap = winx_malloc(BITMAPSIZE);
+    regions = prb_create(compare_regions,NULL,NULL);
     
     /* open the volume */
     f = winx_vopen(volume_letter);
     if(f == NULL){
+        prb_destroy(regions,free_item);
         winx_free(bitmap);
         return NULL;
     }
     
     /* get volume bitmap */
-    next = 0, free_rgn_start = LLINVALID;
+    next = start_lcn, free_rgn_start = LLINVALID;
     do {
         /* get next portion of the bitmap */
         memset(bitmap,0,BITMAPSIZE);
         status = NtFsControlFile(winx_fileno(f),NULL,NULL,0,&iosb,
-            FSCTL_GET_VOLUME_BITMAP,&next,sizeof(ULONGLONG),
-            bitmap,BITMAPSIZE);
+            FSCTL_GET_VOLUME_BITMAP,&next,sizeof(ULONGLONG),bitmap,
+            BITMAPSIZE);
         if(NT_SUCCESS(status)){
             NtWaitForSingleObject(winx_fileno(f),FALSE,NULL);
             status = iosb.Status;
@@ -512,16 +573,18 @@ winx_volume_region *winx_get_free_volume_regions(char volume_letter,
             winx_fclose(f);
             winx_free(bitmap);
             if(flags & WINX_GVR_ALLOW_PARTIAL_SCAN){
-                return rlist;
+                return regions;
             } else {
-                winx_list_destroy((list_entry **)(void *)&rlist);
+                prb_destroy(regions,free_item);
                 return NULL;
             }
         }
         
         /* scan through the returned bitmap info */
         start = bitmap->StartLcn;
-        for(i = 0; i < min(bitmap->ClustersToEndOfVol, 8 * BITMAPBYTES); i++){
+        n = min(BITMAPBYTES * 8, bitmap->ClustersToEndOfVol);
+        if(next - start + length < n) n = next - start + length;
+        for(i = next - start; i < n; i++){
             if(!(bitmap->Map[ i/8 ] & bitshift[ i % 8 ])){
                 /* cluster is free */
                 if(free_rgn_start == LLINVALID)
@@ -529,11 +592,11 @@ winx_volume_region *winx_get_free_volume_regions(char volume_letter,
             } else {
                 /* cluster isn't free */
                 if(free_rgn_start != LLINVALID){
-                    /* add free region to the list */
-                    rgn = (winx_volume_region *)winx_list_insert((list_entry **)(void *)&rlist,
-                        (list_entry *)rgn,sizeof(winx_volume_region));
+                    /* add free region to the tree */
+                    rgn = winx_malloc(sizeof(winx_volume_region));
                     rgn->lcn = free_rgn_start;
                     rgn->length = start + i - free_rgn_start;
+                    (void)prb_insert(regions,(void *)rgn);
                     if(cb != NULL){
                         if(cb(rgn,user_defined_data))
                             goto done;
@@ -543,16 +606,20 @@ winx_volume_region *winx_get_free_volume_regions(char volume_letter,
             }
         }
         
+        /* break if we have scanned all the requested clusters */
+        if(length <= i - (next - start)) break;
+        length -= i - (next - start);
+
         /* go to the next portion of data */
         next = bitmap->StartLcn + i;
     } while(status != STATUS_SUCCESS);
 
     if(free_rgn_start != LLINVALID){
-        /* add free region to the list */
-        rgn = (winx_volume_region *)winx_list_insert((list_entry **)(void *)&rlist,
-            (list_entry *)rgn,sizeof(winx_volume_region));
+        /* add free region to the tree */
+        rgn = winx_malloc(sizeof(winx_volume_region));
         rgn->lcn = free_rgn_start;
         rgn->length = start + i - free_rgn_start;
+        (void)prb_insert(regions,(void *)rgn);
         if(cb != NULL){
             if(cb(rgn,user_defined_data))
                 goto done;
@@ -564,156 +631,151 @@ done:
     /* cleanup */
     winx_fclose(f);
     winx_free(bitmap);
-    return rlist;
+    return regions;
 }
 
 /**
- * @brief Adds a range of clusters to
- * the specified list of volume regions.
- * @param[in,out] rlist the list of regions.
+ * @brief Adds a region to the
+ * specified tree of regions.
+ * @param[in,out] regions the tree of regions.
  * @param[in] lcn the logical cluster number
  * of the region to be added.
- * @param[in] length size of the region to be
- * added, in clusters.
- * @return Pointer to the updated list of regions.
- * @note For performance sake this routine doesn't
- * insert regions of zero length.
+ * @param[in] length size of the region
+ * to be added, in clusters.
+ * @return The region the added
+ * range of clusters belongs to.
  */
-winx_volume_region *winx_add_volume_region(winx_volume_region *rlist,
+winx_volume_region *winx_add_volume_region(struct prb_table *regions,
         ULONGLONG lcn,ULONGLONG length)
 {
-    winx_volume_region *r, *rnext, *rprev = NULL;
+    winx_volume_region *rgn, *item, *prev, *next;
+    struct prb_traverser t;
     
-    /* don't insert regions of zero length */
-    if(length == 0) return rlist;
+    /* validate parameters */
+    if(regions == NULL || length == 0) return NULL;
     
-    for(r = rlist; r; r = r->next){
-        if(r->lcn > lcn){
-            if(r != rlist) rprev = r->prev;
-            break;
+    /* allocate memory */
+    rgn = winx_malloc(sizeof(winx_volume_region));
+    
+    /* try to insert the region */
+    rgn->lcn = lcn, rgn->length = length;
+    item = prb_t_insert(&t,regions,(void *)rgn);
+    
+    if(item != rgn){
+        /* a duplicate found */
+        winx_free(rgn); rgn = item;
+        if(rgn->length < length)
+            rgn->length = length;
+    } else {
+        /*
+        * The region inserted successfully,
+        * let's check whether it hits the
+        * previous one or not.
+        */
+        prev = prb_t_prev(&t);
+        if(prev){
+            if(lcn <= prev->lcn + prev->length){
+                if(lcn + length > prev->lcn + prev->length)
+                    prev->length = lcn + length - prev->lcn;
+                prb_delete(regions,rgn);
+                winx_free(rgn);
+                rgn = prev;
+            }
         }
-        if(r->next == rlist){
-            rprev = r;
-            break;
-        }
+        
+        /* advance traverser back */
+        if(rgn != prev) prb_t_next(&t);
     }
 
-    /* hits the new region the previous one? */
-    if(rprev){
-        if(rprev->lcn + rprev->length == lcn){
-            rprev->length += length;
-            if(rprev->lcn + rprev->length == rprev->next->lcn){
-                rprev->length += rprev->next->length;
-                winx_list_remove((list_entry **)(void *)&rlist,
-                    (list_entry *)rprev->next);
-            }
-            return rlist;
+    /*
+    * Check whether the region hits
+    * the following regions or not.
+    */
+    while(1){
+        next = prb_t_next(&t);
+        if(next == NULL) break;
+
+        /* the region follows the inserted one */
+        if(next->lcn > rgn->lcn + rgn->length) break;
+        
+        /* the region hits/overlaps the inserted one */
+        if(next->lcn + next->length > rgn->lcn + rgn->length){
+            rgn->length = next->lcn + next->length - rgn->lcn;
+            prb_delete(regions,next);
+            winx_free(next);
+            break;
         }
+        
+        /* the region is inside the inserted one */
+        prb_t_prev(&t);
+        prb_delete(regions,next);
+        winx_free(next);
     }
-    
-    /* hits the new region the next one? */
-    if(rlist){
-        if(rprev == NULL) rnext = rlist;
-        else rnext = rprev->next;
-        if(lcn + length == rnext->lcn){
-            rnext->lcn = lcn;
-            rnext->length += length;
-            return rlist;
-        }
-    }
-    
-    r = (winx_volume_region *)winx_list_insert((list_entry **)(void *)&rlist,
-        (list_entry *)rprev,sizeof(winx_volume_region));
-    r->lcn = lcn;
-    r->length = length;
-    return rlist;
+
+    return rgn;
 }
 
 /**
- * @brief Subtracts a range of clusters from
- * the specified list of volume regions.
- * @param[in,out] rlist the list of regions.
- * @param[in] lcn the logical cluster number 
+ * @brief Subtracts a region from
+ * the specified tree of regions.
+ * @param[in,out] regions the tree of regions.
+ * @param[in] lcn the logical cluster number
  * of the region to be subtracted.
- * @param[in] length size of the region to be
- * subtracted, in clusters.
- * @return Pointer to the updated list of regions.
+ * @param[in] length size of the region
+ * to be subtracted, in clusters.
  */
-winx_volume_region *winx_sub_volume_region(winx_volume_region *rlist,
+void winx_sub_volume_region(struct prb_table *regions,
         ULONGLONG lcn,ULONGLONG length)
 {
-    winx_volume_region *r, *head, *next = NULL;
-    ULONGLONG remaining_clusters;
-    ULONGLONG new_lcn, new_length;
+    winx_volume_region *rgn, *add_rgn;
 
-    remaining_clusters = length;
-    for(r = rlist; r && remaining_clusters; r = next){
-        head = rlist;
-        next = r->next;
-        if(r->lcn >= lcn + length) break;
-        if(r->lcn + r->length > lcn){
-            /* sure, at least part of the region is inside of the specified range */
-            if(r->lcn >= lcn && (r->lcn + r->length) <= (lcn + length)){
-                /*
-                * the list entry is inside of the specified range
-                * |--------------------|
-                *        |-r-|
-                */
-                remaining_clusters -= r->length;
-                winx_list_remove((list_entry **)(void *)&rlist,
-                    (list_entry *)r);
-                goto next_region;
-            }
-            if(r->lcn < lcn && (r->lcn + r->length) > lcn && \
-              (r->lcn + r->length) <= (lcn + length)){
-                /*
-                * cut the right side of the list entry
-                *     |--------------------|
-                * |----r----|
-                */
-                r->length = lcn - r->lcn;
-                goto next_region;
-            }
-            if(r->lcn >= lcn && r->lcn < (lcn + length)){
-                /*
-                * cut the left side of the list entry
-                * |--------------------|
-                *                   |----r----|
-                */
-                new_lcn = lcn + length;
-                new_length = r->lcn + r->length - (lcn + length);
-                winx_list_remove((list_entry **)(void *)&rlist,
-                    (list_entry *)r);
-                rlist = winx_add_volume_region(rlist,new_lcn,new_length);
-                goto next_region;
-            }
-            if(r->lcn < lcn && (r->lcn + r->length) > (lcn + length)){
-                /*
-                * the specified range is inside of the list entry
-                *   |----|
-                * |-------r--------|
-                */
-                new_lcn = lcn + length;
-                new_length = r->lcn + r->length - (lcn + length);
-                r->length = lcn - r->lcn;
-                rlist = winx_add_volume_region(rlist,new_lcn,new_length);
-                goto next_region;
-            }
-        }
-next_region:
-        if(rlist == NULL) break;
-        if(next == head) break;
+    /* validate parameters */
+    if(regions == NULL || length == 0) return;
+    
+    rgn = winx_add_volume_region(regions,lcn,length);
+    
+    /*
+    * Now all the clusters to be subtracted should
+    * belong to a single region pointed by rgn.
+    * Let's check it, however, for extra safety.
+    */
+    if(lcn < rgn->lcn || lcn + length > rgn->lcn + rgn->length){
+        etrace("winx_add_volume_region failed to do its job");
+        return; /* this point will be reached only in case of bugs presence */
     }
-    return rlist;
+    
+    /* let's cut off the region */
+    if(lcn > rgn->lcn){
+        if(lcn + length == rgn->lcn + rgn->length){
+            /* cut off the end of the region */
+            rgn->length -= length;
+        } else {
+            /* cut off middle part of the region */
+            add_rgn = winx_malloc(sizeof(winx_volume_region));
+            add_rgn->lcn = lcn + length;
+            add_rgn->length = rgn->lcn + rgn->length - add_rgn->lcn;
+            (void)prb_insert(regions,(void *)add_rgn);
+            rgn->length = lcn - rgn->lcn;
+        }
+    } else {
+        if(lcn + length == rgn->lcn + rgn->length){
+            /* remove the entire region */
+            prb_delete(regions,rgn);
+            winx_free(rgn);
+        } else {
+            /* cut off the beginning of the region */
+            rgn->lcn += length; rgn->length -= length;
+        }
+    }
 }
 
 /**
- * @brief Frees memory allocated
+ * @brief Releases memory allocated
  * by winx_get_free_volume_regions.
  */
-void winx_release_free_volume_regions(winx_volume_region *rlist)
+void winx_release_free_volume_regions(struct prb_table *regions)
 {
-    winx_list_destroy((list_entry **)(void *)&rlist);
+    if(regions) prb_destroy(regions,free_item);
 }
 
 /** @} */
